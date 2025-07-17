@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+
+# claude-voice - Main entry point and CLI interface
+# 
+# This is the primary user-facing script that:
+# 1. Handles command-line arguments and options
+# 2. Manages the voice input capture process
+# 3. Sends prompts to Claude Code CLI
+# 4. Processes and speaks responses back to the user
+#
+# Usage:
+#   claude-voice                     # Interactive mode - press SPACE to speak
+#   claude-voice "prompt"            # Direct prompt mode
+#   claude-voice --help              # Show usage help
+#   claude-voice --version           # Show version info
+#
+# Dependencies:
+#   - macOS 10.15+ (for speech recognition)
+#   - Claude Code CLI (must be installed and in PATH)
+#   - AppleScript support for voice input
+#   - macOS 'say' command for text-to-speech
+
+# Set strict error handling
+set -euo pipefail
+
+# Script version
+readonly VERSION="0.1.0"
+
+# Get the directory where this script is located
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Source configuration and utilities
+source "$PROJECT_ROOT/src/lib/config.sh" || {
+    echo "Error: Could not load configuration library" >&2
+    exit 2
+}
+
+source "$PROJECT_ROOT/src/lib/speech-utils.sh" || {
+    echo "Error: Could not load speech utilities" >&2
+    exit 2
+}
+
+# Function to display usage information
+show_usage() {
+    cat << EOF
+claude-voice - Voice interface for Claude Code CLI
+
+Usage:
+    claude-voice [options] [prompt]
+
+Options:
+    --help, -h          Show this help message
+    --version, -v       Show version information
+    --verbose           Enable detailed output
+    --quiet, -q         Minimal output (suppress progress indicators)
+    --config FILE       Use custom configuration file
+
+Arguments:
+    prompt              Optional direct prompt text (bypasses voice input)
+
+Examples:
+    claude-voice                    # Interactive mode
+    claude-voice "Create a function"  # Direct prompt
+    claude-voice --verbose          # Verbose interactive mode
+
+EOF
+}
+
+# Function to display version
+show_version() {
+    echo "claude-voice version $VERSION"
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            --version|-v)
+                show_version
+                exit 0
+                ;;
+            --verbose)
+                export VERBOSE=true
+                shift
+                ;;
+            --quiet|-q)
+                export QUIET=true
+                shift
+                ;;
+            --config)
+                shift
+                export CONFIG_FILE="$1"
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                show_usage
+                exit 1
+                ;;
+            *)
+                # Treat as direct prompt
+                DIRECT_PROMPT="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# Main function
+main() {
+    # Parse command line arguments (this may exit)
+    DIRECT_PROMPT=""
+    parse_args "$@"
+    
+    # Load configuration
+    load_config
+    
+    # Check dependencies
+    check_dependencies
+    
+    if [[ -n "$DIRECT_PROMPT" ]]; then
+        # Direct prompt mode
+        process_prompt "$DIRECT_PROMPT"
+    else
+        # Interactive voice mode
+        run_interactive_mode
+    fi
+}
+
+# Check required dependencies
+check_dependencies() {
+    # Check for Claude Code CLI
+    if ! command -v claude &>/dev/null; then
+        echo "Error: Claude Code CLI not found. Please install it first." >&2
+        echo "Visit: https://claude.ai/code" >&2
+        exit 3
+    fi
+    
+    # Check for macOS
+    if [[ "$(uname)" != "Darwin" ]]; then
+        echo "Error: This tool requires macOS for speech recognition" >&2
+        exit 3
+    fi
+    
+    # Check for osascript (AppleScript)
+    if ! command -v osascript &>/dev/null; then
+        echo "Error: osascript not found. Required for speech recognition." >&2
+        exit 3
+    fi
+}
+
+# Process a single prompt
+process_prompt() {
+    local prompt="$1"
+    local response
+    
+    [[ "$SHOW_PROGRESS" == "true" ]] && echo "🎤 Processing prompt..."
+    
+    # For Phase 1 testing, let's add a simple echo test
+    if [[ "$prompt" == "test" ]]; then
+        response="This is a test response. Claude Voice is working!"
+    else
+        # Send to Claude Code
+        response=$(claude "$prompt" 2>&1) || {
+            echo "Error: Claude Code command failed" >&2
+            return 1
+        }
+    fi
+    
+    # Process and speak the response
+    process_and_speak_response "$response"
+}
+
+# Run interactive voice mode
+run_interactive_mode() {
+    echo "🎤 Claude Voice - Interactive Mode"
+    echo "Press SPACE to start speaking, or Ctrl+C to exit"
+    echo ""
+    
+    while true; do
+        # Wait for user to press space
+        read -n 1 -s -r -p "Ready... " key
+        echo ""
+        
+        if [[ "$key" == " " ]]; then
+            # Capture voice input
+            local prompt
+            prompt=$(capture_voice_input) || {
+                echo "❌ Failed to capture voice input. Try again." >&2
+                continue
+            }
+            
+            if [[ -n "$prompt" ]]; then
+                echo "📝 You said: \"$prompt\""
+                process_prompt "$prompt"
+            else
+                echo "❌ No speech detected. Try again." >&2
+            fi
+        fi
+        
+        echo ""
+    done
+}
+
+# Capture voice input using AppleScript
+capture_voice_input() {
+    osascript "$PROJECT_ROOT/src/lib/voice-input.applescript" 2>/dev/null
+}
+
+# Entry point
+main "$@"
