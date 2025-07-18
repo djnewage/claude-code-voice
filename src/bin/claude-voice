@@ -129,6 +129,7 @@ set_default_config() {
     ENABLE_INTERRUPTION="${ENABLE_INTERRUPTION:-true}"
     GLOBAL_HOTKEY="${GLOBAL_HOTKEY:-cmd+shift+space}"
     SHOW_PROGRESS="${SHOW_PROGRESS:-true}"
+    CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-30}"
     
     log_verbose "Default configuration values set"
 }
@@ -141,9 +142,20 @@ validate_dependencies() {
             "Visit: https://github.com/anthropics/claude-code for installation instructions."
     fi
     
-    if ! claude --version &> /dev/null; then
-        die "Claude Code CLI is not properly configured or authenticated." \
-            "Run 'claude auth' to set up authentication."
+    # Test Claude Code CLI functionality with a simple command
+    local test_output
+    test_output=$(claude --help 2>&1)
+    local test_exit_code=$?
+    
+    if [[ $test_exit_code -ne 0 ]]; then
+        if [[ "$test_output" =~ (authentication|auth|login|unauthorized) ]]; then
+            die "Claude Code CLI is not authenticated." \
+                "Run 'claude auth' to set up authentication."
+        else
+            die "Claude Code CLI is not working properly." \
+                "Error: $test_output" \
+                "Try running 'claude code --help' to diagnose the issue."
+        fi
     fi
     
     if [[ "$(uname)" != "Darwin" ]]; then
@@ -202,6 +214,114 @@ capture_voice_input() {
     fi
 }
 
+call_claude_code() {
+    local prompt="$1"
+    local timeout="${CLAUDE_TIMEOUT:-30}"
+    
+    log_verbose "Calling Claude Code CLI with timeout=${timeout}s"
+    
+    # Create temporary files for capturing output
+    local stdout_file
+    local stderr_file
+    stdout_file=$(mktemp)
+    stderr_file=$(mktemp)
+    
+    # Cleanup function
+    cleanup_temp_files() {
+        rm -f "${stdout_file:-}" "${stderr_file:-}" 2>/dev/null
+    }
+    trap cleanup_temp_files EXIT
+    
+    # Run Claude Code with timeout
+    local claude_pid
+    local exit_code
+    
+    # Start Claude Code in background
+    (
+        exec claude --print "$prompt" >"$stdout_file" 2>"$stderr_file"
+    ) &
+    claude_pid=$!
+    
+    # Wait with timeout
+    local timeout_reached=false
+    local completed=false
+    
+    for ((i=0; i<timeout; i++)); do
+        if ! kill -0 "$claude_pid" 2>/dev/null; then
+            # Process completed
+            wait "$claude_pid"
+            exit_code=$?
+            completed=true
+            break
+        fi
+        sleep 1
+    done
+    
+    # Check if timeout was reached
+    if [[ "$completed" != "true" ]] && kill -0 "$claude_pid" 2>/dev/null; then
+        timeout_reached=true
+        kill -TERM "$claude_pid" 2>/dev/null
+        sleep 2
+        kill -KILL "$claude_pid" 2>/dev/null
+        exit_code=124
+    fi
+    
+    # Read output files
+    local stdout_content=""
+    local stderr_content=""
+    
+    if [[ -f "$stdout_file" ]]; then
+        stdout_content=$(<"$stdout_file")
+    fi
+    
+    if [[ -f "$stderr_file" ]]; then
+        stderr_content=$(<"$stderr_file")
+    fi
+    
+    # Handle timeout
+    if [[ "$timeout_reached" == "true" ]]; then
+        log_error "Claude Code CLI timed out after ${timeout} seconds"
+        echo "TIMEOUT_ERROR"
+        return 124
+    fi
+    
+    # Handle authentication errors
+    if [[ "$stderr_content" =~ (authentication|auth|login|unauthorized|401) ]] || [[ $exit_code -eq 1 && "$stderr_content" =~ (not.*logged.*in|credential) ]]; then
+        log_error "Authentication failure detected"
+        echo "AUTH_ERROR:$stderr_content"
+        return 2
+    fi
+    
+    # Handle network errors
+    if [[ "$stderr_content" =~ (network|connection|timeout|DNS|resolve|unreachable) ]] || [[ $exit_code -eq 1 && "$stderr_content" =~ (connect|network) ]]; then
+        log_error "Network error detected"
+        echo "NETWORK_ERROR:$stderr_content"
+        return 3
+    fi
+    
+    # Handle rate limiting
+    if [[ "$stderr_content" =~ (rate.*limit|too.*many.*requests|429) ]]; then
+        log_error "Rate limiting detected"
+        echo "RATE_LIMIT_ERROR:$stderr_content"
+        return 4
+    fi
+    
+    # Handle general errors
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Claude Code CLI failed with exit code: $exit_code"
+        if [[ -n "$stderr_content" ]]; then
+            echo "GENERAL_ERROR:$stderr_content"
+        else
+            echo "GENERAL_ERROR:Unknown error occurred"
+        fi
+        return $exit_code
+    fi
+    
+    # Success - return stdout content
+    echo "$stdout_content"
+    return 0
+}
+
 process_claude_prompt() {
     local prompt="$1"
     
@@ -217,27 +337,72 @@ process_claude_prompt() {
         echo "🤖 Processing with Claude Code..."
     fi
     
-    # Send to Claude Code CLI
+    # Call Claude Code CLI with integrated error handling
     local claude_response
-    local claude_exit_code
+    claude_response=$(call_claude_code "$prompt")
+    local claude_exit_code=$?
     
-    claude_response=$(claude "$prompt" 2>&1)
-    claude_exit_code=$?
-    
-    if [[ $claude_exit_code -ne 0 ]]; then
-        log_error "Claude Code CLI failed with exit code: $claude_exit_code"
-        echo "❌ Claude Code error: $claude_response"
-        return $claude_exit_code
-    fi
-    
-    # Display the response
-    echo "💬 Claude Code response:"
-    echo "$claude_response"
+    # Handle different error types
+    case $claude_exit_code in
+        0)
+            # Success
+            echo "💬 Claude Code response:"
+            echo "$claude_response"
+            ;;
+        2)
+            # Authentication error
+            local error_msg="${claude_response#AUTH_ERROR:}"
+            echo "❌ Authentication Error:"
+            echo "Claude Code CLI is not authenticated or session has expired."
+            echo "Please run 'claude auth' to authenticate."
+            if [[ -n "$error_msg" ]]; then
+                log_verbose "Auth error details: $error_msg"
+            fi
+            return 2
+            ;;
+        3)
+            # Network error
+            local error_msg="${claude_response#NETWORK_ERROR:}"
+            echo "❌ Network Error:"
+            echo "Unable to connect to Claude Code service."
+            echo "Please check your internet connection and try again."
+            if [[ -n "$error_msg" ]]; then
+                log_verbose "Network error details: $error_msg"
+            fi
+            return 3
+            ;;
+        4)
+            # Rate limiting
+            local error_msg="${claude_response#RATE_LIMIT_ERROR:}"
+            echo "❌ Rate Limit Error:"
+            echo "Too many requests. Please wait a moment and try again."
+            if [[ -n "$error_msg" ]]; then
+                log_verbose "Rate limit details: $error_msg"
+            fi
+            return 4
+            ;;
+        124)
+            # Timeout
+            echo "❌ Timeout Error:"
+            echo "Claude Code CLI timed out after ${CLAUDE_TIMEOUT:-30} seconds."
+            echo "The request may be too complex or the service may be slow."
+            echo "Try a simpler prompt or try again later."
+            return 124
+            ;;
+        *)
+            # General error
+            local error_msg="${claude_response#GENERAL_ERROR:}"
+            echo "❌ Claude Code Error:"
+            echo "$error_msg"
+            log_error "Claude Code CLI failed with exit code: $claude_exit_code"
+            return $claude_exit_code
+            ;;
+    esac
     
     # TODO: In Phase 2, add response processing and TTS
     # For now, just display the raw response
     
-    return 0
+    return $claude_exit_code
 }
 
 create_default_config() {
@@ -257,6 +422,9 @@ TTS_VOLUME="0.7"                    # Volume level (0.0-1.0)
 # Speech Recognition Settings
 SPEECH_TIMEOUT="10"                 # Seconds to wait for speech
 MIN_CONFIDENCE="0.7"                # Recognition confidence threshold
+
+# Claude Code Integration
+CLAUDE_TIMEOUT="30"                 # Claude Code CLI timeout in seconds
 
 # Response Processing
 MAX_SPOKEN_LINES="10"               # Lines before summarization
