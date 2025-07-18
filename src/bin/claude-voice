@@ -158,7 +158,86 @@ validate_dependencies() {
         die "macOS 10.15 or later is required for speech recognition support."
     fi
     
+    # Check for AppleScript voice input file
+    if [[ ! -f "${PROJECT_ROOT}/src/lib/voice-input.applescript" ]]; then
+        die "Voice input AppleScript not found at: ${PROJECT_ROOT}/src/lib/voice-input.applescript"
+    fi
+    
     log_verbose "All dependencies validated successfully"
+}
+
+capture_voice_input() {
+    local timeout="${SPEECH_TIMEOUT:-10}"
+    local confidence="${MIN_CONFIDENCE:-0.7}"
+    local max_retries="${MAX_RETRIES:-3}"
+    
+    log_verbose "Capturing voice input with timeout=$timeout, confidence=$confidence"
+    
+    local applescript_path="${PROJECT_ROOT}/src/lib/voice-input.applescript"
+    local result
+    
+    # Call the AppleScript with parameters
+    result=$(osascript "$applescript_path" "$timeout" "$confidence" "$max_retries" 2>/dev/null)
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Voice input AppleScript failed with exit code: $exit_code"
+        return $exit_code
+    fi
+    
+    # Parse the result
+    if [[ "$result" =~ ^SUCCESS: ]]; then
+        # Extract the text after "SUCCESS:"
+        echo "${result#SUCCESS:}"
+        return 0
+    elif [[ "$result" =~ ^ERROR: ]]; then
+        log_error "Voice input error: ${result#ERROR:}"
+        return 1
+    elif [[ "$result" =~ ^TIMEOUT ]]; then
+        log_warning "Voice input timed out"
+        return 124
+    else
+        log_error "Unexpected voice input result: $result"
+        return 1
+    fi
+}
+
+process_claude_prompt() {
+    local prompt="$1"
+    
+    if [[ -z "$prompt" ]]; then
+        log_error "No prompt provided"
+        return 1
+    fi
+    
+    log_verbose "Processing prompt with Claude Code: $prompt"
+    
+    # Show processing indicator
+    if [[ "${SHOW_PROGRESS:-true}" == "true" ]]; then
+        echo "🤖 Processing with Claude Code..."
+    fi
+    
+    # Send to Claude Code CLI
+    local claude_response
+    local claude_exit_code
+    
+    claude_response=$(claude "$prompt" 2>&1)
+    claude_exit_code=$?
+    
+    if [[ $claude_exit_code -ne 0 ]]; then
+        log_error "Claude Code CLI failed with exit code: $claude_exit_code"
+        echo "❌ Claude Code error: $claude_response"
+        return $claude_exit_code
+    fi
+    
+    # Display the response
+    echo "💬 Claude Code response:"
+    echo "$claude_response"
+    
+    # TODO: In Phase 2, add response processing and TTS
+    # For now, just display the raw response
+    
+    return 0
 }
 
 create_default_config() {
@@ -233,17 +312,39 @@ run_interactive_mode() {
     echo
     
     while true; do
-        echo -n "Ready to listen... "
+        echo -n "🎙️  Ready to listen... "
         
-        echo "TODO: Implement voice input capture"
-        echo "TODO: Send to Claude Code CLI"
-        echo "TODO: Process and speak response"
+        # Capture voice input using AppleScript
+        local voice_input
+        voice_input=$(capture_voice_input)
+        local voice_exit_code=$?
         
-        echo
-        read -p "Type 'quit' to exit: " input
-        if [[ "$input" == "quit" ]]; then
+        # Handle voice input result
+        if [[ $voice_exit_code -ne 0 ]]; then
+            log_error "Voice input failed"
+            echo "Press SPACE to try again, or type 'quit' to exit."
+            read -n1 -s key
+            if [[ "$key" == "q" ]]; then
+                break
+            fi
+            continue
+        fi
+        
+        # Check if user wants to quit
+        if [[ "$voice_input" =~ ^(quit|exit|stop)$ ]]; then
+            log_info "User requested exit"
             break
         fi
+        
+        echo "📝 Heard: \"$voice_input\""
+        echo
+        
+        # Send to Claude Code and process response
+        process_claude_prompt "$voice_input"
+        
+        echo
+        echo "Ready for next prompt..."
+        echo
     done
     
     log_info "Exiting interactive mode"
@@ -258,8 +359,8 @@ run_direct_prompt() {
     echo "Prompt: $prompt"
     echo
     
-    echo "TODO: Send prompt to Claude Code CLI"
-    echo "TODO: Process and speak response"
+    # Process the prompt with Claude Code
+    process_claude_prompt "$prompt"
     
     log_info "Direct prompt processing complete"
 }
